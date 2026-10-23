@@ -158,6 +158,140 @@ class HomographyService {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // AUTOMATIC PAPER SIZE
+  //
+  // A photo taken at an angle makes the paper look shorter/wider than it is,
+  // so measuring the corner distances gives the wrong proportions. We recover
+  // the real width/height ratio from the perspective of the 4 corners
+  // (Zhang & He, "Whiteboard scanning", 2002), assuming a typical phone focal
+  // length, then snap to a standard paper size (A4, F4, Letter, Legal, ID card)
+  // when the result is within 5%.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Height/width ratios of standard papers (portrait).
+  static const Map<String, double> paperRatios = {
+    'A4': 297 / 210,
+    'F4': 330 / 215,
+    'Letter': 279.4 / 215.9,
+    'Legal': 355.6 / 215.9,
+    'Kartu ID': 85.6 / 54,
+    'A5': 210 / 148,
+  };
+
+  /// [quad] = tl, tr, br, bl in pixels of an image of size [imgW]x[imgH].
+  /// Returns (width, height, paperName or null).
+  static (int, int, String?) estimateDocumentSize({
+    required List<Point<double>> quad,
+    required double imgW,
+    required double imgH,
+    bool autoPaper = true,
+    int maxDim = 4000,
+  }) {
+    double d(Point<double> a, Point<double> b) => a.distanceTo(b);
+    final measuredW = max(d(quad[0], quad[1]), d(quad[3], quad[2]));
+    final measuredH = max(d(quad[0], quad[3]), d(quad[1], quad[2]));
+    double ratio = measuredW / max(1.0, measuredH); // width / height
+    String? paper;
+
+    if (autoPaper) {
+      final r = _perspectiveRatio(quad, imgW, imgH);
+      if (r != null && r > 0.2 && r < 5) ratio = r;
+      // Snap to a standard paper size (portrait or landscape)
+      double bestErr = 0.05;
+      paperRatios.forEach((name, hw) {
+        for (final cand in [1 / hw, hw]) {
+          final err = (ratio / cand - 1).abs();
+          if (err < bestErr) {
+            bestErr = err;
+            paper = name;
+            ratio = cand;
+          }
+        }
+      });
+    }
+
+    // Keep roughly the measured resolution, never enlarge beyond it much
+    double w = measuredW, h = w / ratio;
+    if (h < measuredH) {
+      final s = measuredH / h;
+      w *= s;
+      h *= s;
+    }
+    final over = max(w, h) / maxDim;
+    if (over > 1) {
+      w /= over;
+      h /= over;
+    }
+    return (max(50, w.round()), max(50, h.round()), paper);
+  }
+
+  /// Real width/height of the rectangle seen through the camera, or null.
+  static double? _perspectiveRatio(List<Point<double>> q, double imgW, double imgH) {
+    final u0 = imgW / 2, v0 = imgH / 2;
+    List<double> v(Point<double> p) => [p.x - u0, p.y - v0, 1.0];
+    List<double> cross(List<double> a, List<double> b) => [
+          a[1] * b[2] - a[2] * b[1],
+          a[2] * b[0] - a[0] * b[2],
+          a[0] * b[1] - a[1] * b[0],
+        ];
+    double dot(List<double> a, List<double> b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    final m1 = v(q[0]), m2 = v(q[1]), m3 = v(q[3]), m4 = v(q[2]); // tl, tr, bl, br
+    final den2 = dot(cross(m2, m4), m3);
+    final den3 = dot(cross(m3, m4), m2);
+    if (den2.abs() < 1e-9 || den3.abs() < 1e-9) return null;
+    final k2 = dot(cross(m1, m4), m3) / den2;
+    final k3 = dot(cross(m1, m4), m2) / den3;
+    final n2 = [k2 * m2[0] - m1[0], k2 * m2[1] - m1[1], k2 * m2[2] - m1[2]];
+    final n3 = [k3 * m3[0] - m1[0], k3 * m3[1] - m1[1], k3 * m3[2] - m1[2]];
+
+    // Typical phone main camera: focal length ≈ 0.8 × longest image side
+    final f = 0.8 * max(imgW, imgH);
+    final f2 = f * f;
+    final a = n2[0] * n2[0] / f2 + n2[1] * n2[1] / f2 + n2[2] * n2[2];
+    final b = n3[0] * n3[0] / f2 + n3[1] * n3[1] / f2 + n3[2] * n3[2];
+    if (a <= 0 || b <= 0) return null;
+    final r = sqrt(a / b);
+    return r.isFinite ? r : null;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // AUTO ORIENTATION — small copies rotated 0/90/180/270 for the OCR test
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// params: {'input': path, 'outPrefix': path prefix}. Returns 4 file paths
+  /// (rotated 0, 90, 180, 270 degrees clockwise) or null.
+  static List<String>? makeOrientationProbes(Map<String, dynamic> params) {
+    cv.Mat? mat, small;
+    try {
+      mat = cv.imdecode(File(params['input'] as String).readAsBytesSync(), cv.IMREAD_COLOR);
+      if (mat.isEmpty) return null;
+      final s = 1100 / max(mat.cols, mat.rows);
+      small = s < 1
+          ? cv.resize(mat, ((mat.cols * s).round(), (mat.rows * s).round()), interpolation: cv.INTER_AREA)
+          : mat.clone();
+      final p = cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 90]);
+      final (_, base) = cv.imencode('.jpg', small, params: p);
+      p.dispose();
+      final prefix = params['outPrefix'] as String;
+      final out = <String>[];
+      for (final angle in [0, 90, 180, 270]) {
+        final bytes = angle == 0 ? base : (rotateJpegOcv(base, angle, quality: 90) ?? base);
+        final path = '${prefix}_rot$angle.jpg';
+        File(path).writeAsBytesSync(bytes);
+        out.add(path);
+      }
+      return out;
+    } catch (e) {
+      print('[HomographyService] makeOrientationProbes error: $e');
+      return null;
+    } finally {
+      mat?.dispose();
+      small?.dispose();
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // AUTOMATIC DOCUMENT EDGE DETECTION
   //
   // Strategy (works even for white paper on a light background):

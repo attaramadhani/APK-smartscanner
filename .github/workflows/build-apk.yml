@@ -29,11 +29,14 @@ jobs:
       - name: Pub get
         run: flutter pub get
 
-      - name: Analyze (info only)
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+      - name: Analyze (errors & warnings shown as annotations)
+        run: |
+          flutter analyze --no-fatal-infos --no-fatal-warnings > analyze.txt 2>&1 || true
+          cat analyze.txt
+          grep -E "^ *(error|warning) " analyze.txt | head -40 | while read -r line; do echo "::warning::$line"; done || true
 
       - name: Build APK (split per ABI)
-        run: flutter build apk --release --split-per-abi
+        run: flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64
 
       - name: Rename APKs
         run: |

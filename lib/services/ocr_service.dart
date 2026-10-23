@@ -54,6 +54,46 @@ class OcrService {
     }
   }
 
+  /// Finds which clockwise rotation (0, 90, 180, 270) makes the text upright,
+  /// by reading the 4 probe images and keeping the one with the most real words.
+  /// Returns 0 when there is not enough text to decide.
+  static Future<int> detectUprightAngle(List<String> probes) async {
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    final word = RegExp(r'^[A-Za-z0-9][A-Za-z0-9.,:;()/\-]*$');
+    final scores = <int>[];
+    try {
+      for (final p in probes) {
+        int score = 0;
+        try {
+          final r = await recognizer.processImage(InputImage.fromFilePath(p));
+          for (final block in r.blocks) {
+            for (final line in block.lines) {
+              for (final el in line.elements) {
+                final t = el.text.trim();
+                if (t.length >= 3 && word.hasMatch(t)) score += t.length;
+              }
+            }
+          }
+        } catch (e) {
+          print('[OcrService] probe error: $e');
+        }
+        scores.add(score);
+      }
+    } finally {
+      await recognizer.close();
+    }
+    if (scores.length != 4) return 0;
+    int best = 0;
+    for (int i = 1; i < 4; i++) {
+      if (scores[i] > scores[best]) best = i;
+    }
+    print('[OcrService] orientation scores: $scores');
+    if (best == 0) return 0;
+    // Only rotate when the evidence is clear
+    if (scores[best] < 25 || scores[best] < scores[0] * 1.6) return 0;
+    return best * 90;
+  }
+
   static Future<List<OcrPage>> recognizeFiles(
     List<String> paths, {
     void Function(int done, int total)? onProgress,

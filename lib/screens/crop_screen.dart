@@ -5,8 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/homography_service.dart';
 import '../services/image_filter_service.dart';
+import '../services/ocr_service.dart';
 
 /// Crop screen: automatic edge detection, draggable corners & edges with a
 /// magnifier, 90° rotation, "full page" toggle, then perspective correction.
@@ -33,6 +35,8 @@ class _CropScreenState extends State<CropScreen> {
 
   bool _isInit = false;
   bool _isProcessing = false;
+  String _processingText = 'Meluruskan dokumen...';
+  String? _paperName;
   String? _initError;
 
   late String _normPath; // EXIF-corrected, size-capped copy of the photo
@@ -50,6 +54,10 @@ class _CropScreenState extends State<CropScreen> {
   List<Offset>? _detected;
   bool _showingFull = false;
 
+  // Smart options (remembered)
+  bool _autoPaper = true;   // fix proportions & snap to A4/F4/Letter/...
+  bool _autoRotate = true;  // turn the page so the text is upright
+
   Offset? _dragPosition;
   int _dragged = -1; // 0..3 corners, 4..7 edges (top, right, bottom, left)
 
@@ -58,7 +66,71 @@ class _CropScreenState extends State<CropScreen> {
   @override
   void initState() {
     super.initState();
+    _loadPrefs();
     _loadImage();
+  }
+
+  Future<void> _loadPrefs() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _autoPaper = p.getBool('auto_paper_size') ?? true;
+        _autoRotate = p.getBool('auto_rotate_text') ?? true;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _savePrefs() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setBool('auto_paper_size', _autoPaper);
+      await p.setBool('auto_rotate_text', _autoRotate);
+    } catch (_) {}
+  }
+
+  void _showSmartOptions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheet) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 14),
+                child: Text('Penyesuaian Otomatis', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              ),
+              SwitchListTile(
+                value: _autoPaper,
+                title: const Text('Ukuran kertas otomatis'),
+                subtitle: const Text('Memperbaiki proporsi kertas yang difoto miring dan menyesuaikan ke A4, F4, Letter, Legal, A5 atau kartu ID',
+                    style: TextStyle(fontSize: 12)),
+                onChanged: (v) {
+                  setSheet(() {});
+                  setState(() => _autoPaper = v);
+                  _savePrefs();
+                },
+              ),
+              SwitchListTile(
+                value: _autoRotate,
+                title: const Text('Putar otomatis (teks tegak)'),
+                subtitle: const Text('Membaca arah tulisan lalu memutar halaman agar tidak miring/terbalik',
+                    style: TextStyle(fontSize: 12)),
+                onChanged: (v) {
+                  setSheet(() {});
+                  setState(() => _autoRotate = v);
+                  _savePrefs();
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _loadImage() async {
@@ -203,7 +275,10 @@ class _CropScreenState extends State<CropScreen> {
       );
       return;
     }
-    setState(() => _isProcessing = true);
+    setState(() {
+      _isProcessing = true;
+      _processingText = 'Meluruskan dokumen...';
+    });
     try {
       final rotated = _rotationAngle == 90 || _rotationAngle == 270;
       final w = (rotated ? _imgHeight : _imgWidth).toDouble();
@@ -214,16 +289,20 @@ class _CropScreenState extends State<CropScreen> {
       final br = Offset(_br.dx * w, _br.dy * h);
       final bl = Offset(_bl.dx * w, _bl.dy * h);
 
-      int destW = max((tr - tl).distance, (br - bl).distance).round();
-      int destH = max((bl - tl).distance, (br - tr).distance).round();
-      // Keep output at a sane size (max 4000 px) for memory & PDF size
-      final over = max(destW, destH) / 4000;
-      if (over > 1) {
-        destW = (destW / over).round();
-        destH = (destH / over).round();
-      }
-      destW = max(destW, 50);
-      destH = max(destH, 50);
+      // Real proportions of the paper (+ snap to A4/F4/Letter... if enabled)
+      final (destW, destH, paper) = HomographyService.estimateDocumentSize(
+        quad: [
+          Point<double>(tl.dx, tl.dy),
+          Point<double>(tr.dx, tr.dy),
+          Point<double>(br.dx, br.dy),
+          Point<double>(bl.dx, bl.dy),
+        ],
+        imgW: w,
+        imgH: h,
+        // Only meaningful when the corners were placed on a real sheet
+        autoPaper: _autoPaper && !_showingFull,
+      );
+      _paperName = paper;
 
       final croppedPath = await compute(_processPerspectiveCropInBg, {
         'path': _normPath,
@@ -235,6 +314,17 @@ class _CropScreenState extends State<CropScreen> {
       });
 
       if (croppedPath == null) throw Exception('Transformasi perspektif gagal.');
+
+      if (_autoRotate) {
+        if (mounted) setState(() => _processingText = 'Menyesuaikan arah tulisan...');
+        await _autoOrient(croppedPath);
+      }
+      if (mounted && _paperName != null) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Ukuran kertas disesuaikan: $_paperName'),
+          duration: const Duration(seconds: 2),
+        ));
+      }
       if (mounted) Navigator.pop(context, croppedPath);
     } catch (e) {
       print('Error perspective cropping: $e');
@@ -244,6 +334,38 @@ class _CropScreenState extends State<CropScreen> {
           SnackBar(content: Text('Gagal memotong dokumen: $e'), backgroundColor: Colors.redAccent),
         );
       }
+    }
+  }
+
+  /// Rotates the cropped page (and its preview) so the text is upright.
+  Future<void> _autoOrient(String croppedPath) async {
+    try {
+      final previewPath = '${croppedPath}_preview.jpg';
+      final source = await File(previewPath).exists() ? previewPath : croppedPath;
+      final probes = await compute(HomographyService.makeOrientationProbes, {
+        'input': source,
+        'outPrefix': croppedPath,
+      });
+      if (probes == null) return;
+      final angle = await OcrService.detectUprightAngle(probes);
+      for (final p in probes) {
+        try {
+          await File(p).delete();
+        } catch (_) {}
+      }
+      if (angle == 0) return;
+      await compute(HomographyService.rotateFilesInPlace, {
+        'paths': [croppedPath, previewPath],
+        'angle': angle,
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Halaman diputar otomatis $angle° agar tulisan tegak'),
+          duration: const Duration(seconds: 2),
+        ));
+      }
+    } catch (e) {
+      print('Auto orient error: $e');
     }
   }
 
@@ -338,6 +460,13 @@ class _CropScreenState extends State<CropScreen> {
           icon: const Icon(Icons.close),
           onPressed: () => Navigator.pop(context, null),
         ),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.auto_awesome, color: (_autoPaper || _autoRotate) ? const Color(0xFF2DD4BF) : Colors.white54),
+            tooltip: 'Penyesuaian otomatis',
+            onPressed: _showSmartOptions,
+          ),
+        ],
       ),
       body: !_isInit
           ? const Center(
@@ -415,14 +544,14 @@ class _CropScreenState extends State<CropScreen> {
           Positioned.fill(
             child: Container(
               color: Colors.black54,
-              child: const Center(
+              child: Center(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    CircularProgressIndicator(color: Color(0xFF14B8A6)),
-                    SizedBox(height: 16),
-                    Text('Meluruskan dokumen...',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    const CircularProgressIndicator(color: Color(0xFF14B8A6)),
+                    const SizedBox(height: 16),
+                    Text(_processingText,
+                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   ],
                 ),
               ),

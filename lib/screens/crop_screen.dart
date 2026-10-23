@@ -520,7 +520,13 @@ class _CropScreenState extends State<CropScreen> {
     Offset toPx(Offset rel) => Offset(dL + rel.dx * dW, dT + rel.dy * dH);
     final tlP = toPx(_tl), trP = toPx(_tr), brP = toPx(_br), blP = toPx(_bl);
 
-    return Stack(
+    // The Stack must be given the full box size explicitly: its only
+    // non-positioned child can be a zero-size widget, which would otherwise
+    // shrink the Stack to 0 px wide and shift the whole picture sideways.
+    return SizedBox(
+      width: boxW,
+      height: boxH,
+      child: Stack(
       clipBehavior: Clip.none,
       children: [
         Positioned(left: dL, top: dT, width: dW, height: dH, child: _imageView()),
@@ -539,7 +545,7 @@ class _CropScreenState extends State<CropScreen> {
         _cornerHandle(1, trP),
         _cornerHandle(2, brP),
         _cornerHandle(3, blP),
-        _buildMagnifier(),
+        if (_dragPosition != null && _dragged >= 0 && _dragged <= 3) _buildMagnifier(),
         if (_isProcessing)
           Positioned.fill(
             child: Container(
@@ -558,6 +564,7 @@ class _CropScreenState extends State<CropScreen> {
             ),
           ),
       ],
+      ),
     );
   }
 

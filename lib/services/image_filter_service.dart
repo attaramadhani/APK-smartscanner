@@ -163,6 +163,36 @@ class ImageFilterService {
     return out;
   }
 
+  /// Paper (white) and ink (black) levels of a flattened image, from its
+  /// histogram: most pixels are paper, the darkest 1% are ink.
+  static (double, double) _autoLevels(cv.Mat flat) {
+    final gray = flat.channels == 3 ? cv.cvtColor(flat, cv.COLOR_BGR2GRAY) : flat.clone();
+    final s = 400 / max(gray.cols, gray.rows);
+    final small = s < 1
+        ? cv.resize(gray, (max(1, (gray.cols * s).round()), max(1, (gray.rows * s).round())), interpolation: cv.INTER_AREA)
+        : gray.clone();
+    final data = Uint8List.fromList(small.data);
+    gray.dispose();
+    small.dispose();
+    final hist = List<int>.filled(256, 0);
+    for (final v in data) {
+      hist[v]++;
+    }
+    int pct(double p) {
+      final target = data.length * p;
+      int acc = 0;
+      for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc >= target) return i;
+      }
+      return 255;
+    }
+
+    final white = (pct(0.55) - 8).clamp(200, 250).toDouble();
+    final black = pct(0.01).clamp(20, 120).toDouble();
+    return (black, white);
+  }
+
   static cv.Mat _unsharp(cv.Mat mat, {double amount = 0.6, double sigma = 1.5}) {
     final blurred = cv.gaussianBlur(mat, (0, 0), sigma);
     final result = cv.addWeighted(mat, 1.0 + amount, blurred, -amount, 0);
@@ -196,7 +226,8 @@ class ImageFilterService {
   /// Tanpa Bayang — keeps colours, removes shadows and makes paper white.
   static cv.Mat _noShadowMat(cv.Mat mat) {
     final flat = _flatten(mat);
-    final lv = _levels(flat, 30, 245);
+    final (black, white) = _autoLevels(flat);
+    final lv = _levels(flat, black * 0.6, white, gamma: 1.25);
     final out = _unsharp(lv, amount: 0.5, sigma: 1.2);
     flat.dispose(); lv.dispose();
     return out;
@@ -205,17 +236,19 @@ class ImageFilterService {
   /// Warna Ajaib — white paper, deeper ink, more vivid colour stamps/logos.
   static cv.Mat _magicColorMat(cv.Mat mat) {
     final flat = _flatten(mat);
-    final lv = _levels(flat, 40, 235, gamma: 1.15);
+    final (black, white) = _autoLevels(flat);
+    // Strong curve: paper pure white, ink deep & bold (CamScanner-like)
+    final lv = _levels(flat, black, white, gamma: 1.45);
     final hsv = cv.cvtColor(lv, cv.COLOR_BGR2HSV);
     final hCh = cv.extractChannel(hsv, 0);
     final sCh = cv.extractChannel(hsv, 1);
     final vCh = cv.extractChannel(hsv, 2);
-    final sEnh = sCh.convertTo(cv.MatType.CV_8UC1, alpha: 1.35);
+    final sEnh = sCh.convertTo(cv.MatType.CV_8UC1, alpha: 1.5);
     final vm = cv.VecMat.fromList([hCh, sEnh, vCh]);
     final merged = cv.merge(vm);
     vm.dispose();
     final bgr = cv.cvtColor(merged, cv.COLOR_HSV2BGR);
-    final out = _unsharp(bgr, amount: 0.6, sigma: 1.0);
+    final out = _unsharp(bgr, amount: 0.8, sigma: 1.0);
     flat.dispose(); lv.dispose(); hsv.dispose(); hCh.dispose(); sCh.dispose();
     vCh.dispose(); sEnh.dispose(); merged.dispose(); bgr.dispose();
     return out;
@@ -264,13 +297,13 @@ class ImageFilterService {
   static cv.Mat _bandWMat(cv.Mat mat) {
     final gray = cv.cvtColor(mat, cv.COLOR_BGR2GRAY);
     final flat = _flatten(gray);
-    final (otsu, bin) = cv.threshold(flat, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-    bin.dispose();
-    final t = otsu.clamp(150.0, 225.0);
-    final soft = cv.gaussianBlur(flat, (0, 0), 0.6);
+    final (black, white) = _autoLevels(flat);
+    // Threshold sits between ink and paper; faint pencil/pen still turns black
+    final t = white - 0.35 * (white - black);
+    final soft = cv.gaussianBlur(flat, (0, 0), 0.7);
     final lut = List<num>.generate(256, (i) {
-      final v = ((i - (t - 45)) / 50.0).clamp(0.0, 1.0);
-      return (pow(v, 1.6) * 255).round();
+      final v = ((i - (t - 25)) / 40.0).clamp(0.0, 1.0);
+      return (pow(v, 1.5) * 255).round();
     });
     final lutMat = cv.Mat.fromList(1, 256, cv.MatType.CV_8UC1, lut);
     final mapped = cv.LUT(soft, lutMat);
@@ -283,7 +316,8 @@ class ImageFilterService {
   static cv.Mat _grayscaleMat(cv.Mat mat) {
     final gray = cv.cvtColor(mat, cv.COLOR_BGR2GRAY);
     final flat = _flatten(gray);
-    final lv = _levels(flat, 25, 240, gamma: 1.1);
+    final (black, white) = _autoLevels(flat);
+    final lv = _levels(flat, black * 0.7, white, gamma: 1.3);
     final sharp = _unsharp(lv, amount: 0.5, sigma: 1.2);
     final out = cv.cvtColor(sharp, cv.COLOR_GRAY2BGR);
     gray.dispose(); flat.dispose(); lv.dispose(); sharp.dispose();

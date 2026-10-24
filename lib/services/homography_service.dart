@@ -320,7 +320,10 @@ class HomographyService {
           ? cv.resize(full, ((w * s).round(), (h * s).round()), interpolation: cv.INTER_AREA)
           : full.clone();
 
-      final hough = _detectByLines(small);
+      // Normal sensitivity first, then a more sensitive pass for low-contrast
+      // photos (white paper on a light table).
+      final hough = _detectByLines(small, lumaLow: 20, lumaHigh: 50, chromaLow: 8, chromaHigh: 24) ??
+          _detectByLines(small, lumaLow: 8, lumaHigh: 24, chromaLow: 5, chromaHigh: 15);
       if (hough != null) return hough;
       return _detectByContours(small);
     } catch (e) {
@@ -332,7 +335,13 @@ class HomographyService {
     }
   }
 
-  static List<double>? _detectByLines(cv.Mat small) {
+  static List<double>? _detectByLines(
+    cv.Mat small, {
+    required double lumaLow,
+    required double lumaHigh,
+    required double chromaLow,
+    required double chromaHigh,
+  }) {
     final sw = small.cols, sh = small.rows;
     final List<cv.Mat> trash = [];
     T keep<T extends cv.Mat>(T m) {
@@ -353,9 +362,9 @@ class HomographyService {
       final bMed = keep(cv.medianBlur(bCh, 7));
       final sMed = keep(cv.medianBlur(sCh, 7));
 
-      final e1 = keep(cv.canny(lClosed, 20, 50));
-      final e2 = keep(cv.canny(bMed, 8, 24));
-      final e3 = keep(cv.canny(sMed, 8, 24));
+      final e1 = keep(cv.canny(lClosed, lumaLow, lumaHigh));
+      final e2 = keep(cv.canny(bMed, chromaLow, chromaHigh));
+      final e3 = keep(cv.canny(sMed, chromaLow, chromaHigh));
       final e12 = keep(cv.bitwiseOR(e1, e2));
       final edges = keep(cv.bitwiseOR(e12, e3));
 
@@ -377,8 +386,16 @@ class HomographyService {
         all.add(_Line(ints[i].toDouble(), ints[i + 1].toDouble(),
             ints[i + 2].toDouble(), ints[i + 3].toDouble()));
       }
-      final lines = _mergeLines(all, 12);
-      if (lines.length < 4) return null;
+      final real = _mergeLines(all, 12);
+      if (real.length < 3) return null;
+      // The image borders act as a 4th side when the paper runs off the photo.
+      final borders = [
+        _Line(0, 0, sw - 1.0, 0, isBorder: true),
+        _Line(sw - 1.0, 0, sw - 1.0, sh - 1.0, isBorder: true),
+        _Line(0, sh - 1.0, sw - 1.0, sh - 1.0, isBorder: true),
+        _Line(0, 0, 0, sh - 1.0, isBorder: true),
+      ];
+      final lines = [...real, ...borders];
 
       // Pairs of roughly parallel, well separated lines
       final List<List<_Line>> pairs = [];
@@ -402,6 +419,8 @@ class HomographyService {
             continue;
           }
           if (_angleDiff(a[0].angle, b[0].angle) < 0.9) continue;
+          final nBorder = [a[0], a[1], b[0], b[1]].where((l) => l.isBorder).length;
+          if (nBorder > 1) continue;
           final p1 = _intersect(a[0], b[0]);
           final p2 = _intersect(a[0], b[1]);
           final p3 = _intersect(a[1], b[1]);
@@ -415,7 +434,7 @@ class HomographyService {
           if (!_isConvex(quad)) continue;
           final ar = _polyArea(quad) / area;
           if (ar < 0.08 || ar > 0.95) continue;
-          final s = _perimeterSupport(supp, sw, sh, quad);
+          final s = _perimeterSupport(supp, sw, sh, quad, skipImageBorder: nBorder > 0);
           final score = s * s * s * pow(ar, 0.3);
           if (score > bestScore) {
             bestScore = score;
@@ -458,7 +477,8 @@ class HomographyService {
           maxIdx = i;
         }
       }
-      if (maxIdx < 0 || maxArea < sw * sh * 0.15) return null;
+      // A contour covering (almost) the whole photo is background texture, not paper
+      if (maxIdx < 0 || maxArea < sw * sh * 0.15 || maxArea > sw * sh * 0.9) return null;
 
       final hullMat = cv.convexHull(contours[maxIdx]);
       final hull = cv.VecPoint.fromMat(hullMat);
@@ -559,10 +579,19 @@ class HomographyService {
     return s.abs() / 2;
   }
 
-  static double _perimeterSupport(Uint8List edge, int w, int h, List<Point<double>> q) {
+  static double _perimeterSupport(Uint8List edge, int w, int h, List<Point<double>> q,
+      {bool skipImageBorder = false}) {
+    bool onBorder(Point<double> p, Point<double> r) {
+      const t = 3.0;
+      final vertical = (p.x - r.x).abs() < t && (p.x.abs() < t || (p.x - (w - 1)).abs() < t);
+      final horizontal = (p.y - r.y).abs() < t && (p.y.abs() < t || (p.y - (h - 1)).abs() < t);
+      return vertical || horizontal;
+    }
+
     int n = 0, hit = 0;
     for (int i = 0; i < 4; i++) {
       final p = q[i], r = q[(i + 1) % 4];
+      if (skipImageBorder && onBorder(p, r)) continue;
       final len = sqrt(pow(r.x - p.x, 2) + pow(r.y - p.y, 2));
       final steps = max(2, len ~/ 2);
       for (int k = 0; k <= steps; k++) {
@@ -631,7 +660,9 @@ class _Line {
   double get midX => (x1 + x2) / 2;
   double get midY => (y1 + y2) / 2;
 
-  _Line(this.x1, this.y1, this.x2, this.y2);
+  final bool isBorder;
+
+  _Line(this.x1, this.y1, this.x2, this.y2, {this.isBorder = false});
 
   /// Perpendicular distance from (px, py) to the infinite line.
   double distanceTo(double px, double py) {
